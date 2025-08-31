@@ -1,102 +1,112 @@
-name: AI Trading Bot Orchestrator
+name: Trading Orchestrator (IST)
+
 on:
   schedule:
-    - cron: '*/3 * * * *'  # Every 3 minutes
-  workflow_dispatch:  # Manual trigger button
+    # Universe update at 08:45 IST = 03:15 UTC (Mon–Fri)
+    - cron: '15 3 * * 1-5'
+    # Market scans every 15 minutes from 09:15–14:55 IST (UTC conversions below)
+    # 09:15 IST = 03:45 UTC
+    - cron: '45 3 * * 1-5'
+    # 09:30–13:45 IST = 04:00–08:45 UTC, every :00,:15,:30,:45
+    - cron: '0,15,30,45 4-8 * * 1-5'
+    # 14:00–14:45 IST ≈ 08:30–09:15 UTC in quarter steps
+    - cron: '0,15,30,45 9 * * 1-5'
+    # Optional final tick near 14:55 IST = 09:25 UTC
+    - cron: '25 9 * * 1-5'
+  workflow_dispatch:
 
 jobs:
-  ai-orchestrator:
+  orchestrate:
     runs-on: ubuntu-latest
     steps:
-      - name: AI Trading Decision Engine
+      - name: Decide and call bot endpoints
+        shell: bash
         run: |
-          echo "🤖 Starting AI Trading Orchestrator..."
-          
-          # Get current time in IST
-          CURRENT_HOUR=$(TZ='Asia/Kolkata' date +%H)
-          CURRENT_MIN=$(TZ='Asia/Kolkata' date +%M)
-          CURRENT_DAY=$(TZ='Asia/Kolkata' date +%u)  # 1=Monday, 7=Sunday
-          
-          echo "Current time: ${CURRENT_HOUR}:${CURRENT_MIN} IST (Day: ${CURRENT_DAY})"
-          
-          # Skip weekends
-          if [ "$CURRENT_DAY" -gt "5" ]; then
-            echo "⏭️ Weekend - skipping trading operations"
+          set -euo pipefail
+
+          if [ -z "${{ secrets.BOT_URL }}" ]; then
+            echo "BOT_URL secret is missing"; exit 1
+          fi
+
+          # India time
+          IST_HH=$(TZ='Asia/Kolkata' date +%H)
+          IST_MM=$(TZ='Asia/Kolkata' date +%M)
+          IST_HHMM=$(TZ='Asia/Kolkata' date +%H:%M)
+          IST_DOW=$(TZ='Asia/Kolkata' date +%u)  # 1=Mon ... 7=Sun
+
+          echo "IST now: $IST_HH:$IST_MM (DoW=$IST_DOW)"
+
+          # Skip weekends (extra safety)
+          if [ "$IST_DOW" -gt 5 ]; then
+            echo "Weekend, skipping."
             exit 0
           fi
-          
-          # Skip outside market hours (9:00 AM to 4:00 PM IST)
-          if [ "$CURRENT_HOUR" -lt "9" ] || [ "$CURRENT_HOUR" -gt "16" ]; then
-            echo "⏭️ Outside market hours - skipping"
-            exit 0
+
+          # Market window: 09:15–15:15 IST
+          in_market_window=false
+          if [ "$IST_HH" -ge 9 ] && [ "$IST_HH" -le 15 ]; then
+            if { [ "$IST_HH" -gt 9 ] || { [ "$IST_HH" -eq 9 ] && [ "$IST_MM" -ge 15 ]; }; } \
+               && { [ "$IST_HH" -lt 15 ] || { [ "$IST_HH" -eq 15 ] && [ "$IST_MM" -lt 15 ]; }; }; then
+              in_market_window=true
+            fi
           fi
-          
-          # Get bot status
-          echo "📊 Checking bot status..."
-          BOT_STATUS=$(curl -s "${{ secrets.BOT_URL }}/api/status" || echo '{"error":"connection_failed"}')
-          echo "Bot status: $BOT_STATUS"
-          
-          # Simple AI decision logic based on time and conditions
+
           ACTIONS_TO_TAKE=""
-          
-          # Always check health
-          ACTIONS_TO_TAKE="health-check"
-          
-          # Market session logic
-          if [ "$CURRENT_HOUR" -eq "9" ] && [ "$CURRENT_MIN" -lt "30" ]; then
-            echo "🌅 Market opening session - universe update"
+
+          # 1) Universe update exactly at 08:45 IST
+          if [ "$IST_HHMM" = "08:45" ]; then
+            echo "🌅 Universe update (08:45 IST)"
             ACTIONS_TO_TAKE="$ACTIONS_TO_TAKE,universe-update"
           fi
-          
-          # Lunch break check (12:30 PM to 1:30 PM IST)
-          if [ "$CURRENT_HOUR" -eq "12" ] && [ "$CURRENT_MIN" -gt "30" ] || [ "$CURRENT_HOUR" -eq "13" ] && [ "$CURRENT_MIN" -lt "30" ]; then
-            echo "🍽️ Lunch break - only monitoring"
-            ACTIONS_TO_TAKE="monitor-positions"
-          else
-            # Regular trading hours - check if we should scan
-            if [ "$CURRENT_MIN" -eq "0" ] || [ "$CURRENT_MIN" -eq "15" ] || [ "$CURRENT_MIN" -eq "30" ] || [ "$CURRENT_MIN" -eq "45" ]; then
+
+          # 2) Continuous scans every 15 minutes (no lunch break)
+          if [ "$in_market_window" = true ]; then
+            if [ "$IST_MM" -eq 0 ] || [ "$IST_MM" -eq 15 ] || [ "$IST_MM" -eq 30 ] || [ "$IST_MM" -eq 45 ] || [ "$IST_MM" -eq 55 ]; then
               echo "🔍 Regular scan time"
               ACTIONS_TO_TAKE="$ACTIONS_TO_TAKE,scan-opportunities"
             fi
-            
-            # Always monitor if we might have positions
+
+            # 3) Always monitor during market window
             ACTIONS_TO_TAKE="$ACTIONS_TO_TAKE,monitor-positions"
           fi
-          
-          echo "🎯 Actions planned: $ACTIONS_TO_TAKE"
-          
-          # Execute each action
-          IFS=',' read -ra ACTIONS <<< "$ACTIONS_TO_TAKE"
-          for action in "${ACTIONS[@]}"; do
-            action=$(echo "$action" | xargs)  # Remove whitespace
-            if [ -n "$action" ]; then
-              echo "🚀 Executing: $action"
-              
-              case "$action" in
-                "health-check")
-                  RESPONSE=$(curl -s -X POST "${{ secrets.BOT_URL }}/cron/health-check" || echo "failed")
-                  echo "Health check result: $RESPONSE"
-                  ;;
-                "monitor-positions")
-                  RESPONSE=$(curl -s -X POST "${{ secrets.BOT_URL }}/cron/monitor-positions" || echo "failed")
-                  echo "Monitor positions result: $RESPONSE"
-                  ;;
-                "scan-opportunities")
-                  RESPONSE=$(curl -s -X POST "${{ secrets.BOT_URL }}/cron/scan-opportunities" || echo "failed")
-                  echo "Scan opportunities result: $RESPONSE"
-                  ;;
-                "universe-update")
-                  RESPONSE=$(curl -s -X POST "${{ secrets.BOT_URL }}/cron/universe-update" || echo "failed")
-                  echo "Universe update result: $RESPONSE"
-                  ;;
-                *)
-                  echo "Unknown action: $action"
-                  ;;
-              esac
-              
-              # Small delay between actions
-              sleep 2
+
+          # Always do a health check
+          ACTIONS_TO_TAKE="$ACTIONS_TO_TAKE,health-check"
+
+          # Normalize list (trim, dedupe)
+          IFS=',' read -ra RAW <<< "$ACTIONS_TO_TAKE"
+          declare -A seen=()
+          ACTIONS=()
+          for a in "${RAW[@]}"; do
+            a="$(echo "$a" | xargs)"
+            if [ -n "$a" ] && [ -z "${seen[$a]+x}" ]; then
+              ACTIONS+=("$a")
+              seen[$a]=1
             fi
           done
-          
-          echo "✅ AI Orchestrator cycle completed"
+
+          echo "Planned actions: ${ACTIONS[*]}"
+
+          for action in "${ACTIONS[@]}"; do
+            echo "🚀 Executing: $action"
+            case "$action" in
+              universe-update)
+                curl -sS -X POST "${{ secrets.BOT_URL }}/cron/universe-update" || true
+                ;;
+              scan-opportunities)
+                curl -sS -X POST "${{ secrets.BOT_URL }}/cron/scan-opportunities" || true
+                ;;
+              monitor-positions)
+                curl -sS -X POST "${{ secrets.BOT_URL }}/cron/monitor-positions" || true
+                ;;
+              health-check)
+                curl -sS "${{ secrets.BOT_URL }}/cron/health-check" || true
+                ;;
+              *)
+                echo "Unknown action: $action"
+                ;;
+            esac
+            sleep 2
+          done
+
+          echo "✅ Orchestration cycle complete"
