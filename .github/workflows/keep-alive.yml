@@ -1,0 +1,21 @@
+name: Keep Alive (All Day)
+
+on:
+  schedule:
+    - cron: '*/8 * * * *'   # every 8 minutes, all day
+  workflow_dispatch:
+
+jobs:
+  keep:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${{ secrets.BOT_URL }}" ]; then
+            echo "BOT_URL secret is missing"; exit 1
+          fi
+          echo "🏥 Keep-alive ping"
+          curl -sS "${{ secrets.BOT_URL }}/cron/health-check" || true
+          echo "✅ Done"
