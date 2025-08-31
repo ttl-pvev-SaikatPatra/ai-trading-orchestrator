@@ -1,0 +1,102 @@
+name: AI Trading Bot Orchestrator
+on:
+  schedule:
+    - cron: '*/3 * * * *'  # Every 3 minutes
+  workflow_dispatch:  # Manual trigger button
+
+jobs:
+  ai-orchestrator:
+    runs-on: ubuntu-latest
+    steps:
+      - name: AI Trading Decision Engine
+        run: |
+          echo "🤖 Starting AI Trading Orchestrator..."
+          
+          # Get current time in IST
+          CURRENT_HOUR=$(TZ='Asia/Kolkata' date +%H)
+          CURRENT_MIN=$(TZ='Asia/Kolkata' date +%M)
+          CURRENT_DAY=$(TZ='Asia/Kolkata' date +%u)  # 1=Monday, 7=Sunday
+          
+          echo "Current time: ${CURRENT_HOUR}:${CURRENT_MIN} IST (Day: ${CURRENT_DAY})"
+          
+          # Skip weekends
+          if [ "$CURRENT_DAY" -gt "5" ]; then
+            echo "⏭️ Weekend - skipping trading operations"
+            exit 0
+          fi
+          
+          # Skip outside market hours (9:00 AM to 4:00 PM IST)
+          if [ "$CURRENT_HOUR" -lt "9" ] || [ "$CURRENT_HOUR" -gt "16" ]; then
+            echo "⏭️ Outside market hours - skipping"
+            exit 0
+          fi
+          
+          # Get bot status
+          echo "📊 Checking bot status..."
+          BOT_STATUS=$(curl -s "${{ secrets.BOT_URL }}/api/status" || echo '{"error":"connection_failed"}')
+          echo "Bot status: $BOT_STATUS"
+          
+          # Simple AI decision logic based on time and conditions
+          ACTIONS_TO_TAKE=""
+          
+          # Always check health
+          ACTIONS_TO_TAKE="health-check"
+          
+          # Market session logic
+          if [ "$CURRENT_HOUR" -eq "9" ] && [ "$CURRENT_MIN" -lt "30" ]; then
+            echo "🌅 Market opening session - universe update"
+            ACTIONS_TO_TAKE="$ACTIONS_TO_TAKE,universe-update"
+          fi
+          
+          # Lunch break check (12:30 PM to 1:30 PM IST)
+          if [ "$CURRENT_HOUR" -eq "12" ] && [ "$CURRENT_MIN" -gt "30" ] || [ "$CURRENT_HOUR" -eq "13" ] && [ "$CURRENT_MIN" -lt "30" ]; then
+            echo "🍽️ Lunch break - only monitoring"
+            ACTIONS_TO_TAKE="monitor-positions"
+          else
+            # Regular trading hours - check if we should scan
+            if [ "$CURRENT_MIN" -eq "0" ] || [ "$CURRENT_MIN" -eq "15" ] || [ "$CURRENT_MIN" -eq "30" ] || [ "$CURRENT_MIN" -eq "45" ]; then
+              echo "🔍 Regular scan time"
+              ACTIONS_TO_TAKE="$ACTIONS_TO_TAKE,scan-opportunities"
+            fi
+            
+            # Always monitor if we might have positions
+            ACTIONS_TO_TAKE="$ACTIONS_TO_TAKE,monitor-positions"
+          fi
+          
+          echo "🎯 Actions planned: $ACTIONS_TO_TAKE"
+          
+          # Execute each action
+          IFS=',' read -ra ACTIONS <<< "$ACTIONS_TO_TAKE"
+          for action in "${ACTIONS[@]}"; do
+            action=$(echo "$action" | xargs)  # Remove whitespace
+            if [ -n "$action" ]; then
+              echo "🚀 Executing: $action"
+              
+              case "$action" in
+                "health-check")
+                  RESPONSE=$(curl -s -X POST "${{ secrets.BOT_URL }}/cron/health-check" || echo "failed")
+                  echo "Health check result: $RESPONSE"
+                  ;;
+                "monitor-positions")
+                  RESPONSE=$(curl -s -X POST "${{ secrets.BOT_URL }}/cron/monitor-positions" || echo "failed")
+                  echo "Monitor positions result: $RESPONSE"
+                  ;;
+                "scan-opportunities")
+                  RESPONSE=$(curl -s -X POST "${{ secrets.BOT_URL }}/cron/scan-opportunities" || echo "failed")
+                  echo "Scan opportunities result: $RESPONSE"
+                  ;;
+                "universe-update")
+                  RESPONSE=$(curl -s -X POST "${{ secrets.BOT_URL }}/cron/universe-update" || echo "failed")
+                  echo "Universe update result: $RESPONSE"
+                  ;;
+                *)
+                  echo "Unknown action: $action"
+                  ;;
+              esac
+              
+              # Small delay between actions
+              sleep 2
+            fi
+          done
+          
+          echo "✅ AI Orchestrator cycle completed"
