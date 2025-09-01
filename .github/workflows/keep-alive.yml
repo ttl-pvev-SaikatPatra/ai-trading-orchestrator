@@ -1,32 +1,42 @@
-name: Keep Alive (All Day)
+# .github/workflows/keep-alive.yml
+name: Keep Alive (Trading Day)
 
 on:
   schedule:
-    - cron: '*/8 * * * *'   # every 8 minutes, all day (UTC)
+    # 07:30–16:30 IST ≈ 02:00–11:00 UTC, every 8 minutes on weekdays
+    - cron: '*/8 2-11 * * 1-5'
   workflow_dispatch:
 
 jobs:
   keep:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping health endpoint (with retries)
+      - name: Ping health with warm-up and backoff
         shell: bash
         run: |
           set -euo pipefail
           if [ -z "${{ secrets.BOT_URL }}" ]; then
-            echo "BOT_URL secret is missing"; exit 1
+            echo "BOT_URL secret missing"; exit 1
           fi
+          echo "🏥 Keep-alive ping"
           curl_retry() {
             local url="$1"
-            for i in 1 2 3 4; do
-              if curl -sS "$url" --max-time 20 --retry 0 --fail; then
+            local attempts=4
+            local delay=3
+            for ((i=1;i<=attempts;i++)); do
+              # Warmup HEAD (short) to trigger cold start
+              curl -sS -I --connect-timeout 10 --max-time 12 "$url" || true
+              # Main GET with generous timeout
+              if curl -sS     --connect-timeout 12 --max-time 75 --fail "$url"; then
+                echo "✅ Warmed: $url"
                 return 0
               fi
-              sleep $((i*2))
+              echo "WARN: attempt $i failed; retry in ${delay}s" >&2
+              sleep "$delay"
+              delay=$((delay*2))
             done
             echo "WARN: keep-alive failed after retries: $url" >&2
             return 0
           }
-          echo "🏥 Keep-alive ping"
           curl_retry "${{ secrets.BOT_URL }}/cron/health-check"
           echo "✅ Done"
