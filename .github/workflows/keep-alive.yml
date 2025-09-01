@@ -2,20 +2,31 @@ name: Keep Alive (All Day)
 
 on:
   schedule:
-    - cron: '*/8 * * * *'   # every 8 minutes, all day
+    - cron: '*/8 * * * *'   # every 8 minutes, all day (UTC)
   workflow_dispatch:
 
 jobs:
   keep:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping health endpoint
+      - name: Ping health endpoint (with retries)
         shell: bash
         run: |
           set -euo pipefail
           if [ -z "${{ secrets.BOT_URL }}" ]; then
             echo "BOT_URL secret is missing"; exit 1
           fi
+          curl_retry() {
+            local url="$1"
+            for i in 1 2 3 4; do
+              if curl -sS "$url" --max-time 20 --retry 0 --fail; then
+                return 0
+              fi
+              sleep $((i*2))
+            done
+            echo "WARN: keep-alive failed after retries: $url" >&2
+            return 0
+          }
           echo "🏥 Keep-alive ping"
-          curl -sS "${{ secrets.BOT_URL }}/cron/health-check" || true
+          curl_retry "${{ secrets.BOT_URL }}/cron/health-check"
           echo "✅ Done"
