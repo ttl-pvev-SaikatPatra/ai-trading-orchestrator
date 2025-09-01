@@ -1,124 +1,120 @@
+# .github/workflows/orchestrator.yml
 name: Trading Orchestrator (IST)
 
 on:
   schedule:
-    # Universe update at 08:45 IST = 03:15 UTC (Mon–Fri)
+    # Pre-open wake 08:30 IST = 03:00 UTC (Mon–Fri)
+    - cron: '0 3 * * 1-5'
+    # Universe update 08:45 IST = 03:15 UTC
     - cron: '15 3 * * 1-5'
-    # First scan at 09:15 IST = 03:45 UTC
+    # First scan 09:15 IST = 03:45 UTC
     - cron: '45 3 * * 1-5'
-    # 09:30–13:45 IST = 04:00–08:45 UTC, every :00,:15,:30,:45
+    # Scans every :00,:15,:30,:45 during 09:30–13:45 IST = 04:00–08:45 UTC
     - cron: '0,15,30,45 4-8 * * 1-5'
-    # 14:00–14:45 IST ≈ 08:30–09:15 UTC
-    - cron: '0,15,30,45 9 * * 1-5'
-    # Optional 14:55 IST = 09:25 UTC
+    # Afternoon 14:00–14:45 IST ≈ 08:30–09:15 UTC
+    # Scan on :30,:45 and monitor on :31,:46 to avoid collision
+    - cron: '30,45 9 * * 1-5'
+    - cron: '31,46 9 * * 1-5'
+    # Optional final scan near 14:55 IST = 09:25 UTC
     - cron: '25 9 * * 1-5'
+    # EOD exit 15:10 IST = 09:40 UTC
+    - cron: '40 9 * * 1-5'
   workflow_dispatch:
 
 jobs:
   orchestrate:
     runs-on: ubuntu-latest
     steps:
-      - name: Decide and call bot endpoints
+      - name: Orchestrate cron calls (wake + retries/backoff)
         shell: bash
         run: |
           set -euo pipefail
           if [ -z "${{ secrets.BOT_URL }}" ]; then
-            echo "BOT_URL secret is missing"; exit 1
+            echo "BOT_URL secret missing"; exit 1
           fi
 
-          # helpers
+          # Curl with retries and exponential backoff; do not fail workflow on last try
           curl_retry() {
-            # curl with retries and backoff (max 4 attempts)
-            # usage: curl_retry METHOD URL
             local method="$1"; shift
             local url="$1"; shift
-            for i in 1 2 3 4; do
-              if curl -sS -X "$method" "$url" --max-time 20 --retry 0 --fail; then
+            local attempts=5
+            local delay=3
+            for ((i=1;i<=attempts;i++)); do
+              if curl -sS -X "$method" "$url" --connect-timeout 12 --max-time 75 --retry 0 --fail; then
                 return 0
               fi
-              sleep $((i*2))
+              echo "WARN: $url attempt $i failed; backoff ${delay}s" >&2
+              sleep "$delay"
+              delay=$((delay*2))
             done
-            echo "WARN: curl failed after retries: $url" >&2
-            return 0  # do not fail workflow
+            echo "WARN: $url failed after retries" >&2
+            return 0
           }
 
-          # India time context (Actions cron is UTC) [doc: schedule is UTC]
+          # Wake instance before deciding actions (two quick probes)
+          curl -sS --connect-timeout 5  --max-time 10 "${{ secrets.BOT_URL }}/health" || true
+          curl -sS --connect-timeout 12 --max-time 60 "${{ secrets.BOT_URL }}/health" || true
+
+          # India time snapshot (cron is UTC)
           IST_HH=$(TZ='Asia/Kolkata' date +%H)
           IST_MM=$(TZ='Asia/Kolkata' date +%M)
           IST_HHMM=$(TZ='Asia/Kolkata' date +%H:%M)
-          IST_DOW=$(TZ='Asia/Kolkata' date +%u)  # 1=Mon ... 7=Sun
+          IST_DOW=$(TZ='Asia/Kolkata' date +%u)  # 1=Mon..7=Sun
           echo "IST now: $IST_HH:$IST_MM (DoW=$IST_DOW)"
 
-          # Skip weekends (extra safety)
+          # Skip weekends (defense in depth)
           if [ "$IST_DOW" -gt 5 ]; then
-            echo "Weekend, skipping."
+            echo "Weekend; exit"
             exit 0
           fi
 
-          # Market window: 09:15–15:15 IST
-          in_market_window=false
+          plan=()
+
+          # Pre-open 08:30 IST — refresh account, verify auth
+          if [ "$IST_HHMM" = "08:30" ]; then
+            plan+=("POST:/cron/account-update" "POST:/cron/auth-check")
+          fi
+
+          # Universe update 08:45 IST
+          if [ "$IST_HHMM" = "08:45" ]; then
+            plan+=("POST:/cron/universe-update" "GET:/health")
+          fi
+
+          # Market window 09:15–15:15 IST
+          in_market=false
           if [ "$IST_HH" -ge 9 ] && [ "$IST_HH" -le 15 ]; then
             if { [ "$IST_HH" -gt 9 ] || { [ "$IST_HH" -eq 9 ] && [ "$IST_MM" -ge 15 ]; }; } \
                && { [ "$IST_HH" -lt 15 ] || { [ "$IST_HH" -eq 15 ] && [ "$IST_MM" -lt 15 ]; }; }; then
-              in_market_window=true
+              in_market=true
             fi
           fi
 
-          ACTIONS_TO_TAKE=""
-
-          # 1) Universe update exactly at 08:45 IST
-          if [ "$IST_HHMM" = "08:45" ]; then
-            echo "🌅 Universe update (08:45 IST)"
-            ACTIONS_TO_TAKE="$ACTIONS_TO_TAKE,universe-update"
-          fi
-
-          # 2) Continuous scans every 15 minutes (+:55)
-          if [ "$in_market_window" = true ]; then
+          if [ "$in_market" = true ]; then
+            # Quarter-hour scans + :55
             if [ "$IST_MM" -eq 0 ] || [ "$IST_MM" -eq 15 ] || [ "$IST_MM" -eq 30 ] || [ "$IST_MM" -eq 45 ] || [ "$IST_MM" -eq 55 ]; then
-              echo "🔍 Regular scan time"
-              ACTIONS_TO_TAKE="$ACTIONS_TO_TAKE,scan-opportunities"
+              plan+=("POST:/cron/scan-opportunities")
             fi
-            # 3) Always monitor during market window
-            ACTIONS_TO_TAKE="$ACTIONS_TO_TAKE,monitor-positions"
+            # Monitor every tick in window
+            plan+=("POST:/cron/monitor-positions")
           fi
 
-          # Always do a health check
-          ACTIONS_TO_TAKE="$ACTIONS_TO_TAKE,health-check"
+          # EOD exit 15:10 IST safeguard
+          if [ "$IST_HHMM" = "15:10" ]; then
+            plan+=("POST:/cron/eod-exit")
+          fi
 
-          # Normalize list (trim, dedupe)
-          IFS=',' read -ra RAW <<< "$ACTIONS_TO_TAKE"
-          declare -A seen=()
-          ACTIONS=()
-          for a in "${RAW[@]}"; do
-            a="$(echo "$a" | xargs)"
-            if [ -n "$a" ] && [ -z "${seen[$a]+x}" ]; then
-              ACTIONS+=("$a")
-              seen[$a]=1
-            fi
-          done
-          echo "Planned actions: ${ACTIONS[*]}"
+          # Always health check
+          plan+=("GET:/cron/health-check")
 
-          for action in "${ACTIONS[@]}"; do
-            echo "🚀 Executing: $action"
-            case "$action" in
-              universe-update)
-                curl_retry POST "${{ secrets.BOT_URL }}/cron/universe-update"
-                ;;
-              scan-opportunities)
-                # small stagger to avoid clashing with monitor
-                sleep 1
-                curl_retry POST "${{ secrets.BOT_URL }}/cron/scan-opportunities"
-                ;;
-              monitor-positions)
-                curl_retry POST "${{ secrets.BOT_URL }}/cron/monitor-positions"
-                ;;
-              health-check)
-                curl_retry GET  "${{ secrets.BOT_URL }}/cron/health-check"
-                ;;
-              *)
-                echo "Unknown action: $action"
-                ;;
-            esac
+          echo "Planned: ${plan[*]}"
+
+          for item in "${plan[@]}"; do
+            method="${item%%:*}"
+            path="${item#*:}"
+            url="${{ secrets.BOT_URL }}${path}"
+            echo "➡️  $method $path"
+            curl_retry "$method" "$url"
             sleep 1
           done
+
           echo "✅ Orchestration cycle complete"
