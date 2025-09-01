@@ -104,7 +104,7 @@ jobs:
           fi
 
           # Always health check
-          plan+=("GET:/cron/health-check")
+          plan+=("GET:/health")
 
           echo "Planned: ${plan[*]}"
 
