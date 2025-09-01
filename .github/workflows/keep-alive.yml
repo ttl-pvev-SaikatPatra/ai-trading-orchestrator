@@ -38,5 +38,5 @@ jobs:
             echo "WARN: keep-alive failed after retries: $url" >&2
             return 0
           }
-          curl_retry "${{ secrets.BOT_URL }}/cron/health-check"
+          curl_retry "${{ secrets.BOT_URL }}/health"
           echo "✅ Done"
